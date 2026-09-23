@@ -76,6 +76,10 @@ export interface UserSettings {
   auto_delete_unit: 'minutes' | 'hours' | 'days' | 'weeks'
   custom_kaomojis: CustomKaomoji[]
   ui_scale: number
+  /** Keep the clipboard window floating above other windows while open. */
+  always_on_top: boolean
+  /** Hide the window when the user types in another app while it is visible. */
+  close_on_typing_when_unfocused: boolean
 }
 
 /** Helper type for boolean settings keys */

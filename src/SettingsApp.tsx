@@ -26,6 +26,8 @@ const DEFAULT_SETTINGS: UserSettings = {
   ui_scale: 1,
   auto_delete_interval: 0,
   auto_delete_unit: 'hours',
+  always_on_top: true,
+  close_on_typing_when_unfocused: true,
 }
 
 type ThemeMode = 'system' | 'dark' | 'light'
@@ -609,6 +611,48 @@ function SettingsApp() {
               <Switch
                 checked={settings.enable_dynamic_tray_icon}
                 onChange={() => handleToggle('enable_dynamic_tray_icon')}
+                isDark={isDark}
+              />
+            </div>
+          </div>
+
+          <div
+            className={clsx('mt-4 pt-4 border-t', isDark ? 'border-white/5' : 'border-gray-100')}
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">Always on Top</div>
+                <div className={clsx('text-xs mt-0.5', isDark ? 'text-gray-400' : 'text-gray-500')}>
+                  Keep the clipboard window floating above other windows while open.
+                </div>
+              </div>
+              <Switch
+                checked={settings.always_on_top}
+                onChange={() => {
+                  handleToggle('always_on_top')
+                  // Apply immediately to the running window
+                  invoke('set_window_always_on_top', { alwaysOnTop: !settings.always_on_top }).catch(
+                    console.error
+                  )
+                }}
+                isDark={isDark}
+              />
+            </div>
+          </div>
+
+          <div
+            className={clsx('mt-4 pt-4 border-t', isDark ? 'border-white/5' : 'border-gray-100')}
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-sm font-medium">Close on Background Typing</div>
+                <div className={clsx('text-xs mt-0.5', isDark ? 'text-gray-400' : 'text-gray-500')}>
+                  Hide the window when typing in another app while the clipboard is visible.
+                </div>
+              </div>
+              <Switch
+                checked={settings.close_on_typing_when_unfocused}
+                onChange={() => handleToggle('close_on_typing_when_unfocused')}
                 isDark={isDark}
               />
             </div>

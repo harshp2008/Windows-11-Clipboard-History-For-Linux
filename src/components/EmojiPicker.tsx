@@ -290,7 +290,7 @@ export function EmojiPicker({ isDark, opacity }: EmojiPickerProps) {
           </>
         ) : (
           <span className="text-xs dark:text-win11-text-tertiary text-win11Light-text-secondary">
-            Click to paste emoji
+            Click to paste • window stays open
           </span>
         )
       }

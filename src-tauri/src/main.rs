@@ -16,7 +16,12 @@ use win11_clipboard_history_lib::clipboard_manager::{ClipboardItem, ClipboardMan
 use win11_clipboard_history_lib::config_manager::{resolve_window_position, ConfigManager};
 use win11_clipboard_history_lib::emoji_manager::{EmojiManager, EmojiUsage};
 use win11_clipboard_history_lib::focus_manager::x11_robust_activate;
-use win11_clipboard_history_lib::focus_manager::{restore_focused_window, save_focused_window};
+use win11_clipboard_history_lib::focus_manager::{
+    restore_focused_window, save_focused_window,
+    wayland_activate_window_id, wayland_clear_saved_window_id, wayland_get_saved_window_id,
+    wayland_get_clipboard_window_id, wayland_save_focused_window_id,
+    wayland_set_keep_above,
+};
 use win11_clipboard_history_lib::input_simulator::simulate_paste_keystroke;
 use win11_clipboard_history_lib::permission_checker;
 use win11_clipboard_history_lib::rendering_env;
@@ -33,6 +38,14 @@ static STARTED_IN_BACKGROUND: AtomicBool = AtomicBool::new(false);
 /// While false, background mode will still hide the window on focus
 /// After the first user toggle, this is set to true to allow normal show/hide behavior
 static INITIAL_SHOW_ALLOWED: AtomicBool = AtomicBool::new(false);
+
+/// Guard flag set while a single-instance IPC tab-switch is in flight.
+/// Prevents the focus-loss handler from hiding the window during the brief
+/// moment the second Tauri process steals compositor focus.
+static IPC_TAB_SWITCH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+/// Guard flag set while keep-open emoji paste is temporarily yielding focus to the target editor.
+static KEEP_OPEN_PASTE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Application state shared across all handlers
 pub struct AppState {
@@ -163,18 +176,16 @@ async fn paste_item(app: AppHandle, state: State<'_, AppState>, id: String) -> R
 
     match item {
         Some(item) => {
-            // 2. Prepare Environment (Hide Window -> Restore Focus)
-            WindowController::hide(&app);
-            PasteHelper::prepare_target_window(&app).await?;
+            // 1. Write cleanly to in-memory clipboard
+            {
+                let mut manager = state.clipboard_manager.lock();
+                manager.prepare_item_for_paste(&item).map_err(|e| e.to_string())?;
+                // Notify frontend of history change (item moved to top)
+                let history = manager.get_history();
+                let _ = app.emit("history-sync", &history);
+            }
 
-            // 3. Perform Paste
-            let mut manager = state.clipboard_manager.lock();
-            manager.paste_item(&item).map_err(|e| e.to_string())?;
-
-            // 4. Notify frontend of history change (item moved to top)
-            let history = manager.get_history();
-            drop(manager); // Release lock before emitting
-            let _ = app.emit("history-sync", &history);
+            PasteHelper::execute_paste_pipeline(&app).await?;
         }
         None => {
             eprintln!(
@@ -196,31 +207,47 @@ async fn paste_text(
     state: State<'_, AppState>,
     text: String,
     item_type: Option<String>,
+    _hide_window: Option<bool>, // Ignored: we always do single-shot paste-and-close now
 ) -> Result<(), String> {
     let _paste_guard = state.paste_gate.lock().await;
 
-    // 0. Record usage if applicable
+    // Record emoji usage.
     if let Some(t) = item_type.as_deref() {
         if t == "emoji" {
             state.emoji_manager.lock().record_usage(&text);
         }
     }
 
-    // 1. Prepare Environment
-    WindowController::hide(&app);
-    PasteHelper::prepare_target_window(&app).await?;
-
-    // 2. Set Clipboard & Mark
+    // 1. Write text cleanly to in-memory clipboard
     {
         let mut manager = state.clipboard_manager.lock();
         manager.mark_text_as_pasted(&text);
         manager.set_text_robust(&text)?;
     }
 
-    // 3. Simulate Paste
-    simulate_paste_keystroke().map_err(|e| e.to_string())?;
+    PasteHelper::execute_paste_pipeline(&app).await?;
 
     Ok(())
+}
+
+/// Update the main window's always-on-top state live (called from Settings UI).
+/// On Wayland: uses window-calls MakeAbove/UnmakeAbove (GTK set_keep_above is
+/// ignored by GNOME Mutter for xdg-shell surfaces).
+/// On X11: uses GTK/Tauri set_always_on_top.
+#[tauri::command]
+fn set_window_always_on_top(app: AppHandle, always_on_top: bool) -> Result<(), String> {
+    if is_wayland() {
+        match wayland_get_clipboard_window_id() {
+            Ok(cb_id) => wayland_set_keep_above(cb_id, always_on_top),
+            Err(e) => Err(format!("Could not find clipboard window: {}", e)),
+        }
+    } else if let Some(window) = app.get_webview_window("main") {
+        window
+            .set_always_on_top(always_on_top)
+            .map_err(|e| format!("set_always_on_top failed: {}", e))
+    } else {
+        Err("Main window not found".to_string())
+    }
 }
 
 #[tauri::command]
@@ -250,11 +277,7 @@ async fn paste_gif_from_url(
     }
 
     // 3. Prepare Environment & Paste
-    WindowController::hide(&app);
-    PasteHelper::prepare_target_window(&app).await?;
-
-    // The clipboard is already set by paste_gif_to_clipboard_with_uri, we just need to paste
-    simulate_paste_keystroke().map_err(|e| e.to_string())?;
+    PasteHelper::execute_paste_pipeline(&app).await?;
 
     Ok(())
 }
@@ -262,9 +285,7 @@ async fn paste_gif_from_url(
 #[tauri::command]
 async fn finish_paste(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let _paste_guard = state.paste_gate.lock().await;
-    WindowController::hide(&app);
-    PasteHelper::prepare_target_window(&app).await?;
-    simulate_paste_keystroke().map_err(|e| e.to_string())?;
+    PasteHelper::execute_paste_pipeline(&app).await?;
     Ok(())
 }
 
@@ -309,71 +330,37 @@ async fn finish_setup(app: AppHandle) -> Result<(), String> {
 struct PasteHelper;
 
 impl PasteHelper {
-    const TARGET_READY_TIMEOUT: Duration = Duration::from_millis(750);
-    const TARGET_READY_POLL_INTERVAL: Duration = Duration::from_millis(2);
-    const TARGET_STABLE_SAMPLES: u8 = 2;
 
-    /// Restores focus to the previous window and waits for it to settle.
-    /// This ensures keystrokes are sent to the correct application.
-    async fn prepare_target_window(app: &AppHandle) -> Result<(), String> {
-        // `hide()` is dispatched to Tauri's event loop when commands run off
-        // the main thread. Observe its completion before asking X11 to restore
-        // focus, otherwise a pending UnmapNotify can steal focus back after an
-        // apparently stable X11 sample.
-        Self::wait_for_popup_to_release_focus(app).await?;
+    async fn execute_paste_pipeline(app: &AppHandle) -> Result<(), String> {
+        // 2. Hide window completely
+        WindowController::hide(app);
+
+        // 3. Unmap settle delay: Give Mutter 70ms to unmap the Wayland surface from the screen
+        tokio::time::sleep(Duration::from_millis(70)).await;
+
+        // 4. Activate target editor window
+        if is_wayland() {
+            let target_id = wayland_get_saved_window_id();
+            if target_id > 0 {
+                if let Err(e) = wayland_activate_window_id(target_id) {
+                    eprintln!("[PasteHelper] Target Activate failed: {}", e);
+                }
+            }
+        } else {
+            let _ = restore_focused_window();
+        }
+
+        // 5. Seat focus settle delay: Give GTK4 / Mutter 120ms to bind keyboard seat focus
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        // 6. Inject keystroke
+        simulate_paste_keystroke().map_err(|e| e.to_string())?;
 
         if is_wayland() {
-            return Ok(());
+            wayland_clear_saved_window_id();
         }
 
-        match restore_focused_window() {
-            Ok(true) => {
-                // Focus was *verified* on the target window by the poller;
-                // no extra settle time is needed.
-            }
-            Ok(false) => {
-                return Err("Target window did not acquire stable focus".to_string());
-            }
-            Err(e) => {
-                return Err(format!("Focus restoration failed: {}", e));
-            }
-        }
         Ok(())
-    }
-
-    /// Waits for Tauri's asynchronous hide/focus events to settle. On Wayland
-    /// this is the strongest target-readiness signal available; on X11 it is
-    /// the prerequisite for explicitly restoring the previously focused app.
-    async fn wait_for_popup_to_release_focus(app: &AppHandle) -> Result<(), String> {
-        let window = app
-            .get_webview_window("main")
-            .ok_or("Main window is not available")?;
-        let start = std::time::Instant::now();
-        let mut stable_samples = 0;
-
-        loop {
-            let last_state = match (window.is_visible(), window.is_focused()) {
-                (Ok(false), Ok(false)) => {
-                    stable_samples += 1;
-                    if stable_samples >= Self::TARGET_STABLE_SAMPLES {
-                        return Ok(());
-                    }
-                    "visible=false, focused=false (settling)".to_string()
-                }
-                (visible, focused) => {
-                    stable_samples = 0;
-                    format!("visible={:?}, focused={:?}", visible, focused)
-                }
-            };
-
-            if start.elapsed() >= Self::TARGET_READY_TIMEOUT {
-                return Err(format!(
-                    "Timed out waiting for the clipboard popup to release focus ({})",
-                    last_state
-                ));
-            }
-            tokio::time::sleep(Self::TARGET_READY_POLL_INTERVAL).await;
-        }
     }
 }
 
@@ -386,27 +373,30 @@ impl WindowController {
         Self::toggle_with_tab(app, None);
     }
 
-    /// Toggle window visibility with optional tab selection
-    /// If tab is Some("emoji"), it will emit an event to switch to the emoji tab
+    /// Toggle window visibility with optional tab selection.
+    /// Used for tray/shortcut toggles where closing the window is intentional.
+    /// If tab is Some("emoji"), emits switch-tab; if window is visible with no
+    /// tab specified, hides it (toggle behaviour).
     pub fn toggle_with_tab(app: &AppHandle, tab: Option<&str>) {
         // User-initiated toggle - mark that we're now allowing shows
-        // This stops the background enforcer from hiding the window
         if STARTED_IN_BACKGROUND.load(Ordering::SeqCst) {
             INITIAL_SHOW_ALLOWED.store(true, Ordering::SeqCst);
         }
 
         if let Some(window) = app.get_webview_window("main") {
             if window.is_visible().unwrap_or(false) {
-                // If window is visible, emit tab switch event if tab is specified
-                // This allows Super+. to switch to emoji tab even when window is open
                 if let Some(tab_name) = tab {
                     let _ = app.emit("switch-tab", tab_name);
                 } else {
                     let _ = window.hide();
                 }
             } else {
-                save_focused_window();
-                // Emit tab switch event before showing window
+                // Capture the previously focused app before we take seat focus.
+                if is_wayland() {
+                    wayland_save_focused_window_id();
+                } else {
+                    save_focused_window();
+                }
                 if let Some(tab_name) = tab {
                     let _ = app.emit("switch-tab", tab_name);
                 }
@@ -415,10 +405,8 @@ impl WindowController {
                 if let Some(state) = app.try_state::<AppState>() {
                     let settings = UserSettingsManager::new().load();
                     let interval_in_minutes = settings.auto_delete_interval_in_minutes();
-
                     let mut manager = state.clipboard_manager.lock();
                     if manager.cleanup_old_items(interval_in_minutes) {
-                        // Mirror background cleanup: persist history explicitly, then emit event
                         manager.save_history();
                         let _ = app.emit("history-cleared", ());
                     }
@@ -426,6 +414,50 @@ impl WindowController {
 
                 Self::position_and_show(&window, app);
             }
+        }
+    }
+
+    /// Show window pre-selected on `tab`, or switch to that tab if already
+    /// visible. NEVER hides/closes the window — for use by the single-instance
+    /// IPC handler where the focus-loss race condition can make is_visible()
+    /// transiently false. The IPC_TAB_SWITCH_IN_PROGRESS flag is cleared by
+    /// the caller after this returns.
+    pub fn show_tab(app: &AppHandle, tab: &str) {
+        if STARTED_IN_BACKGROUND.load(Ordering::SeqCst) {
+            INITIAL_SHOW_ALLOWED.store(true, Ordering::SeqCst);
+        }
+
+        let _ = app.emit("switch-tab", tab);
+
+        if let Some(window) = app.get_webview_window("main") {
+            if window.is_visible().unwrap_or(false) {
+                // If already visible, the switch-tab emit above is sufficient.
+                // Do NOT update, push, or clear SAVED_WAYLAND_TARGET_WINID or FOCUS_HISTORY.
+                return;
+            }
+            // Window is hidden (either intentionally or due to IPC race).
+            // Save the currently focused window so paste still works after show,
+                // BUT only if this isn't an inter-tab switch race condition.
+                if !IPC_TAB_SWITCH_IN_PROGRESS.load(Ordering::SeqCst) {
+                    if is_wayland() {
+                        wayland_save_focused_window_id();
+                    } else {
+                        save_focused_window();
+                    }
+                }
+
+                // Cleanup old items
+                if let Some(state) = app.try_state::<AppState>() {
+                    let settings = UserSettingsManager::new().load();
+                    let interval_in_minutes = settings.auto_delete_interval_in_minutes();
+                    let mut manager = state.clipboard_manager.lock();
+                    if manager.cleanup_old_items(interval_in_minutes) {
+                        manager.save_history();
+                        let _ = app.emit("history-cleared", ());
+                    }
+                }
+
+                Self::position_and_show(&window, app);
         }
     }
 
@@ -451,36 +483,55 @@ impl WindowController {
         }
 
         let is_wayland_session = is_wayland();
+        let always_on_top = UserSettingsManager::new().load().always_on_top;
 
         if is_wayland_session {
-            // Wayland needs to be born "On Top" to be visible
             let _ = window.show();
-            let _ = window.set_always_on_top(true);
+            let _ = window.set_always_on_top(true); // compositor hint (best-effort)
+            // On Wayland, avoid window.set_focus() as it triggers Mutter's Focus Stealing Prevention toast.
+            // The GTK Utility hint, set_keep_above, gtk_window.present(), and window.show() present the window on top cleanly.
+            #[cfg(not(target_os = "linux"))]
             let _ = window.set_focus();
         } else {
-            // X11 born as normal window.
-            // We do NOT activate always_on_top to avoid focus blocking and glitch.
             let _ = window.show();
+            let _ = window.set_focus();
+        }
+
+        // Apply GTK-specific hints
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(gtk_window) = window.gtk_window() {
+                use gtk::prelude::*;
+                gtk_window.set_keep_above(true);
+                gtk_window.set_type_hint(gtk::gdk::WindowTypeHint::Utility);
+                gtk_window.present();
+            }
         }
 
         let window_clone = window.clone();
         let app_clone = app.clone();
 
         std::thread::spawn(move || {
-            // For Wayland, we still need a small delay for the compositor
-            // For X11, we use polling-based wait instead of fixed sleep
             if is_wayland_session {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let _ = window_clone.set_always_on_top(false);
-                let _ = window_clone.set_focus();
+                // On Wayland, skip window.set_focus() to avoid Mutter Focus Stealing Prevention toast.
+                // Use window-calls MakeAbove — retry up to 15 times with 40ms intervals
+                // until Mutter registers the newly created/mapped surface.
+                if always_on_top {
+                    for _ in 0..15 {
+                        std::thread::sleep(std::time::Duration::from_millis(40));
+                        if let Ok(cb_id) = wayland_get_clipboard_window_id() {
+                            let _ = wayland_set_keep_above(cb_id, true);
+                            break;
+                        }
+                    }
+                }
             } else {
-                // Use EWMH _NET_ACTIVE_WINDOW protocol with polling instead of fixed sleep.
-                // This waits for the window to actually appear in X11's client list
-                // before attempting activation, solving the race condition.
                 if let Err(e) = x11_robust_activate("Clipboard History") {
                     eprintln!("[WindowController] X11 activation failed: {}", e);
-                    // Fallback: try xdotool as last resort
                     let _ = Self::x11_activate_window_xdotool();
+                }
+                if always_on_top {
+                    let _ = window_clone.set_always_on_top(true);
                 }
             }
 
@@ -634,7 +685,18 @@ impl SettingsController {
         match app.get_webview_window("settings") {
             Some(window) => {
                 let _ = window.show();
+                // On Wayland, avoid window.set_focus() as it triggers Mutter's Focus Stealing Prevention toast.
+                #[cfg(not(target_os = "linux"))]
                 let _ = window.set_focus();
+                #[cfg(target_os = "linux")]
+                {
+                    if !is_wayland() {
+                        let _ = window.set_focus();
+                    } else if let Ok(gtk_window) = window.gtk_window() {
+                        use gtk::prelude::*;
+                        gtk_window.present();
+                    }
+                }
             }
             None => {
                 // Fallback: recreate the window if it was somehow destroyed
@@ -776,7 +838,10 @@ fn main() {
         println!("    -v, --version    Show version information");
         println!("        --background Start minimized to system tray (for autostart)");
         println!("        --settings   Open settings window on startup");
+        println!("        --clipboard  Open with clipboard history tab selected");
         println!("        --emoji      Open with emoji picker tab selected");
+        println!("        --kaomoji    Open with kaomoji picker tab selected");
+        println!("        --symbols    Open with symbols picker tab selected");
         println!();
         println!("SHORTCUTS:");
         println!("    Super+V          Open clipboard history");
@@ -799,12 +864,18 @@ fn main() {
     // Check if --settings flag is present (for first instance startup)
     let open_settings_on_start = args.iter().any(|arg| arg == "--settings");
 
-    // Check if --emoji flag is present (open with emoji tab)
-    let open_emoji_on_start = args.iter().any(|arg| arg == "--emoji");
+    // Check tab flags (open with a specific tab selected)
+    let open_emoji_on_start    = args.iter().any(|arg| arg == "--emoji");
+    let open_clipboard_on_start = args.iter().any(|arg| arg == "--clipboard");
+    let open_kaomoji_on_start  = args.iter().any(|arg| arg == "--kaomoji");
+    let open_symbols_on_start  = args.iter().any(|arg| arg == "--symbols");
 
     // Clone for use in setup closure
-    let start_in_background_clone = start_in_background;
-    let open_emoji_on_start_clone = open_emoji_on_start;
+    let start_in_background_clone  = start_in_background;
+    let open_emoji_on_start_clone    = open_emoji_on_start;
+    let open_clipboard_on_start_clone = open_clipboard_on_start;
+    let open_kaomoji_on_start_clone  = open_kaomoji_on_start;
+    let open_symbols_on_start_clone  = open_symbols_on_start;
 
     win11_clipboard_history_lib::session::init();
 
@@ -838,19 +909,42 @@ fn main() {
         // Single Instance Plugin: When user triggers shortcut and app is already running,
         // the OS launches a new instance which signals the existing one to toggle
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            // Check if --settings flag is present
+            // Set the IPC flag so the focus-loss handler won't race-hide the window.
+            IPC_TAB_SWITCH_IN_PROGRESS.store(true, Ordering::SeqCst);
+
             if argv.iter().any(|arg| arg == "--settings") {
                 println!(
-                    "[SingleInstance] Secondary instance with --settings flag, opening settings..."
+                    "[SingleInstance] --settings flag: opening settings window"
                 );
+                IPC_TAB_SWITCH_IN_PROGRESS.store(false, Ordering::SeqCst);
                 SettingsController::show(app);
+            } else if argv.iter().any(|arg| arg == "--clipboard") {
+                println!(
+                    "[SingleInstance] --clipboard flag: switching to clipboard tab in-place"
+                );
+                WindowController::show_tab(app, "clipboard");
+                IPC_TAB_SWITCH_IN_PROGRESS.store(false, Ordering::SeqCst);
             } else if argv.iter().any(|arg| arg == "--emoji") {
                 println!(
-                    "[SingleInstance] Secondary instance with --emoji flag, opening emoji picker..."
+                    "[SingleInstance] --emoji flag: switching to emoji tab in-place"
                 );
-                WindowController::toggle_with_tab(app, Some("emoji"));
+                WindowController::show_tab(app, "emoji");
+                IPC_TAB_SWITCH_IN_PROGRESS.store(false, Ordering::SeqCst);
+            } else if argv.iter().any(|arg| arg == "--kaomoji") {
+                println!(
+                    "[SingleInstance] --kaomoji flag: switching to kaomoji tab in-place"
+                );
+                WindowController::show_tab(app, "kaomoji");
+                IPC_TAB_SWITCH_IN_PROGRESS.store(false, Ordering::SeqCst);
+            } else if argv.iter().any(|arg| arg == "--symbols") {
+                println!(
+                    "[SingleInstance] --symbols flag: switching to symbols tab in-place"
+                );
+                WindowController::show_tab(app, "symbols");
+                IPC_TAB_SWITCH_IN_PROGRESS.store(false, Ordering::SeqCst);
             } else {
-                println!("[SingleInstance] Secondary instance detected, toggling window...");
+                IPC_TAB_SWITCH_IN_PROGRESS.store(false, Ordering::SeqCst);
+                println!("[SingleInstance] No tab flag: toggling window");
                 WindowController::toggle(app);
             }
         }))
@@ -967,20 +1061,26 @@ fn main() {
 
             main_window.on_window_event(move |event| match event {
                 // Block any window show attempts when started in background mode
-                // This catches cases where GTK/Tauri automatically shows the window
                 WindowEvent::Focused(true) => {
-                    // Load both flags atomically with SeqCst to avoid race conditions
                     let started_in_background = STARTED_IN_BACKGROUND.load(Ordering::SeqCst);
                     let initial_show_allowed = INITIAL_SHOW_ALLOWED.load(Ordering::SeqCst);
 
-                    // If started in background and initial show hasn't been allowed yet,
-                    // immediately hide the window
                     if started_in_background && !initial_show_allowed {
                         println!("[WindowController] Background mode: intercepted focus, hiding window");
                         let _ = w_clone.hide();
                     }
                 }
                 WindowEvent::Focused(false) => {
+                    // Skip hide if an IPC tab-switch command is in flight.
+                    if IPC_TAB_SWITCH_IN_PROGRESS.load(Ordering::SeqCst) {
+                        return;
+                    }
+
+                    // Skip hide if a keep-open paste (multi-emoji) is temporarily handing focus to target.
+                    if KEEP_OPEN_PASTE_IN_PROGRESS.load(Ordering::SeqCst) {
+                        return;
+                    }
+
                     let state = w_clone.state::<AppState>();
                     if state.is_mouse_inside.load(Ordering::Relaxed) {
                         return;
@@ -1039,6 +1139,33 @@ fn main() {
                 });
             }
 
+            // If --clipboard flag was passed on first startup, emit switch-tab event.
+            if open_clipboard_on_start_clone {
+                let app_handle_for_clipboard = app_handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = app_handle_for_clipboard.emit("switch-tab", "clipboard");
+                });
+            }
+
+            // If --kaomoji flag was passed on first startup, emit switch-tab event.
+            if open_kaomoji_on_start_clone {
+                let app_handle_for_kaomoji = app_handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = app_handle_for_kaomoji.emit("switch-tab", "kaomoji");
+                });
+            }
+
+            // If --symbols flag was passed on first startup, emit switch-tab event.
+            if open_symbols_on_start_clone {
+                let app_handle_for_symbols = app_handle.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _ = app_handle_for_symbols.emit("switch-tab", "symbols");
+                });
+            }
+
             // If --background flag was passed, ensure the main window stays hidden
             // This is the primary mechanism for starting minimized to tray
             // Background mode: spawn enforcer thread as fallback
@@ -1094,6 +1221,7 @@ fn main() {
             get_system_theme,
             refresh_system_theme,
             is_theme_listener_active,
+            set_window_always_on_top,
             permission_checker::check_permissions,
             permission_checker::fix_permissions_now,
             permission_checker::is_first_run,

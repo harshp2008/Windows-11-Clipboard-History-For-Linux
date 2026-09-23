@@ -53,9 +53,10 @@ export function KaomojiPicker({ isDark, opacity, customKaomojis = [] }: KaomojiP
     return getKaomojis(selectedCategory, searchQuery, mappedCustom)
   }, [selectedCategory, searchQuery, customKaomojis])
 
+  // Paste kaomoji while keeping the picker open for consecutive selections.
   const handlePaste = useCallback(async (text: string) => {
     try {
-      await invoke('paste_text', { text })
+      await invoke('paste_text', { text, hideWindow: false })
     } catch (err) {
       console.error('Failed to paste kaomoji', err)
     }
@@ -107,7 +108,7 @@ export function KaomojiPicker({ isDark, opacity, customKaomojis = [] }: KaomojiP
           </>
         ) : (
           <span className="text-xs dark:text-win11-text-tertiary text-win11Light-text-secondary">
-            Click to paste kaomoji
+            Click to paste • window stays open
           </span>
         )
       }

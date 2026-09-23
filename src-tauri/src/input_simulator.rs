@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-type PasteStrategy = (&'static str, fn() -> Result<(), PasteFailure>);
+
 
 enum PasteFailure {
     /// No paste key was attempted, so another backend may safely run.
@@ -27,10 +27,6 @@ const DEVICE_DISCOVERY_GRACE: Duration = Duration::from_millis(100);
 /// immediately; the timeout is only a failure ceiling for a stalled server.
 const X11_KEY_STATE_TIMEOUT: Duration = Duration::from_millis(250);
 const X11_KEY_STATE_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
-/// Kept only for the last-resort xdotool fallback. The primary XTest path
-/// verifies the actual key state and needs no fixed inter-key delay.
-const XDOTOOL_KEY_DELAY_MS: &str = "50";
 
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
@@ -133,14 +129,26 @@ fn warm_up_uinput() {
     }
 }
 
+type PasteStrategy = (&'static str, fn(bool) -> Result<(), PasteFailure>);
+
 pub fn simulate_paste_keystroke() -> Result<(), String> {
-    eprintln!("[SimulatePaste] Sending Ctrl+V...");
+    let wm_class = crate::focus_manager::wayland_get_saved_window_class().to_lowercase();
+    
+    // Terminal heuristics: many terminal emulators bypass the standard Wayland/X11
+    // clipboard abstraction or explicitly reserve Ctrl+V for block-select mode.
+    // Standard Shift+Insert behaves as universal paste across almost all environments.
+    let is_terminal = wm_class.contains("terminal")
+        || wm_class.contains("pty")
+        || wm_class.contains("alacritty")
+        || wm_class.contains("kitty")
+        || wm_class.contains("konsole");
+
+    eprintln!("[SimulatePaste] Sending Paste (is_terminal={})...", is_terminal);
 
     // XTest uses one native X11 connection and verifies that Ctrl is down
-    // before V. xdotool is retained only as a compatibility fallback.
+    // before V. uinput provides a direct kernel-level virtual keyboard.
     const X11_STRATEGIES: &[PasteStrategy] = &[
         ("uinput", simulate_paste_uinput),
-        ("xdotool", simulate_paste_xdotool),
         ("XTest", simulate_paste_xtest),
     ];
     const NON_X11_STRATEGIES: &[PasteStrategy] = &[("uinput", simulate_paste_uinput)];
@@ -152,9 +160,9 @@ pub fn simulate_paste_keystroke() -> Result<(), String> {
     };
 
     for (name, strategy) in strategies {
-        match strategy() {
+        match strategy(is_terminal) {
             Ok(()) => {
-                eprintln!("[SimulatePaste] Ctrl+V sent via {}", name);
+                eprintln!("[SimulatePaste] Paste sent via {}", name);
                 return Ok(());
             }
             Err(PasteFailure::Retryable(error)) => {
@@ -172,9 +180,12 @@ pub fn simulate_paste_keystroke() -> Result<(), String> {
     Err("All paste methods failed".to_string())
 }
 
+
 // =============================================================================
 // X11 / XTest
 // =============================================================================
+
+
 
 fn fake_key<C: x11rb::connection::Connection + x11rb::protocol::xtest::ConnectionExt>(
     conn: &C,
@@ -189,7 +200,7 @@ fn fake_key<C: x11rb::connection::Connection + x11rb::protocol::xtest::Connectio
         .map_err(|error| format!("X11 flush failed: {}", error))
 }
 
-fn simulate_paste_xtest() -> Result<(), PasteFailure> {
+fn simulate_paste_xtest(_is_terminal: bool) -> Result<(), PasteFailure> {
     let mut device = xtest_device_lock().lock();
     if device.is_none() {
         *device = Some(XtestDevice::create().map_err(PasteFailure::Retryable)?);
@@ -453,30 +464,6 @@ fn key_is_pressed(keymap: &[u8; 32], keycode: u8) -> bool {
     keymap[byte] & (1 << bit) != 0
 }
 
-fn simulate_paste_xdotool() -> Result<(), PasteFailure> {
-    let output = std::process::Command::new("xdotool")
-        .args([
-            "key",
-            "--delay",
-            XDOTOOL_KEY_DELAY_MS,
-            "--clearmodifiers",
-            "ctrl+v",
-        ])
-        .output()
-        .map_err(|error| PasteFailure::Retryable(format!("Failed to start xdotool: {}", error)))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        // Once the process started, a failing exit status cannot prove that it
-        // emitted no input. Do not risk a duplicate through another backend.
-        Err(PasteFailure::Ambiguous(format!(
-            "xdotool failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )))
-    }
-}
-
 // =============================================================================
 // Wayland / uinput
 // =============================================================================
@@ -484,6 +471,9 @@ fn simulate_paste_xdotool() -> Result<(), PasteFailure> {
 fn uinput_device_lock() -> &'static Mutex<Option<UinputDevice>> {
     UINPUT_DEVICE.get_or_init(|| Mutex::new(None))
 }
+
+const KEY_LEFTSHIFT: u16 = 42;
+const KEY_INSERT: u16 = 110;
 
 impl UinputDevice {
     fn create() -> Result<Self, String> {
@@ -502,6 +492,12 @@ impl UinputDevice {
             }
             if libc::ioctl(fd, UI_SET_KEYBIT, KEY_V as libc::c_int) < 0 {
                 return Err(last_os_error("Failed to enable KEY_V"));
+            }
+            if libc::ioctl(fd, UI_SET_KEYBIT, KEY_LEFTSHIFT as libc::c_int) < 0 {
+                return Err(last_os_error("Failed to enable KEY_LEFTSHIFT"));
+            }
+            if libc::ioctl(fd, UI_SET_KEYBIT, KEY_INSERT as libc::c_int) < 0 {
+                return Err(last_os_error("Failed to enable KEY_INSERT"));
             }
         }
 
@@ -549,8 +545,8 @@ impl UinputDevice {
         Ok(Self { file })
     }
 
-    fn send_ctrl_v(&mut self) -> Result<(), String> {
-        let sequence = ctrl_v_sequence();
+    fn send_paste(&mut self, is_terminal: bool) -> Result<(), String> {
+        let sequence = paste_sequence(is_terminal);
         if let Err(error) = self.write_events(&sequence) {
             let _ = self.release_all_keys();
             return Err(error);
@@ -562,6 +558,8 @@ impl UinputDevice {
         self.write_events(&[
             input_event(EV_KEY, KEY_V, 0),
             input_event(EV_KEY, KEY_LEFTCTRL, 0),
+            input_event(EV_KEY, KEY_INSERT, 0),
+            input_event(EV_KEY, KEY_LEFTSHIFT, 0),
             input_event(EV_SYN, SYN_REPORT, 0),
         ])
     }
@@ -582,11 +580,11 @@ impl Drop for UinputDevice {
     }
 }
 
-fn simulate_paste_uinput() -> Result<(), PasteFailure> {
+fn simulate_paste_uinput(is_terminal: bool) -> Result<(), PasteFailure> {
     let mut device = uinput_device_lock().lock();
 
     if let Some(existing) = device.as_mut() {
-        match existing.send_ctrl_v() {
+        match existing.send_paste(is_terminal) {
             Ok(()) => return Ok(()),
             Err(error) => {
                 eprintln!("[uinput] Existing device failed: {}", error);
@@ -597,22 +595,31 @@ fn simulate_paste_uinput() -> Result<(), PasteFailure> {
     }
 
     let mut created = UinputDevice::create().map_err(PasteFailure::Retryable)?;
-    created.send_ctrl_v().map_err(PasteFailure::Ambiguous)?;
+    created.send_paste(is_terminal).map_err(PasteFailure::Ambiguous)?;
     *device = Some(created);
     Ok(())
 }
 
-fn ctrl_v_sequence() -> [libc::input_event; 6] {
-    [
-        // One frame makes Ctrl and V visible together; the second releases
-        // both. There is no scheduling window between separate key writes.
-        input_event(EV_KEY, KEY_LEFTCTRL, 1),
-        input_event(EV_KEY, KEY_V, 1),
-        input_event(EV_SYN, SYN_REPORT, 0),
-        input_event(EV_KEY, KEY_V, 0),
-        input_event(EV_KEY, KEY_LEFTCTRL, 0),
-        input_event(EV_SYN, SYN_REPORT, 0),
-    ]
+fn paste_sequence(is_terminal: bool) -> [libc::input_event; 6] {
+    if is_terminal {
+        [
+            input_event(EV_KEY, KEY_LEFTSHIFT, 1),
+            input_event(EV_KEY, KEY_INSERT, 1),
+            input_event(EV_SYN, SYN_REPORT, 0),
+            input_event(EV_KEY, KEY_INSERT, 0),
+            input_event(EV_KEY, KEY_LEFTSHIFT, 0),
+            input_event(EV_SYN, SYN_REPORT, 0),
+        ]
+    } else {
+        [
+            input_event(EV_KEY, KEY_LEFTCTRL, 1),
+            input_event(EV_KEY, KEY_V, 1),
+            input_event(EV_SYN, SYN_REPORT, 0),
+            input_event(EV_KEY, KEY_V, 0),
+            input_event(EV_KEY, KEY_LEFTCTRL, 0),
+            input_event(EV_SYN, SYN_REPORT, 0),
+        ]
+    }
 }
 
 fn input_event(type_: u16, code: u16, value: i32) -> libc::input_event {
@@ -693,8 +700,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ctrl_v_is_emitted_as_two_complete_frames() {
-        let events = ctrl_v_sequence();
+    fn paste_sequence_is_emitted_as_two_complete_frames() {
+        let events = paste_sequence(false);
         let actual: Vec<(u16, u16, i32)> = events
             .iter()
             .map(|event| (event.type_, event.code, event.value))
@@ -711,11 +718,29 @@ mod tests {
                 (EV_SYN, SYN_REPORT, 0),
             ]
         );
+
+        let events_term = paste_sequence(true);
+        let actual_term: Vec<(u16, u16, i32)> = events_term
+            .iter()
+            .map(|event| (event.type_, event.code, event.value))
+            .collect();
+
+        assert_eq!(
+            actual_term,
+            vec![
+                (EV_KEY, KEY_LEFTSHIFT, 1),
+                (EV_KEY, KEY_INSERT, 1),
+                (EV_SYN, SYN_REPORT, 0),
+                (EV_KEY, KEY_INSERT, 0),
+                (EV_KEY, KEY_LEFTSHIFT, 0),
+                (EV_SYN, SYN_REPORT, 0),
+            ]
+        );
     }
 
     #[test]
     fn input_event_bytes_use_the_platform_abi_size() {
-        let events = ctrl_v_sequence();
+        let events = paste_sequence(false);
         assert_eq!(
             input_events_as_bytes(&events).len(),
             events.len() * std::mem::size_of::<libc::input_event>()

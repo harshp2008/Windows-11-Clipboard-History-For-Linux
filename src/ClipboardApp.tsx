@@ -28,6 +28,8 @@ const DEFAULT_SETTINGS: UserSettings = {
   auto_delete_unit: 'hours',
   custom_kaomojis: [],
   ui_scale: 1,
+  always_on_top: true,
+  close_on_typing_when_unfocused: true,
 }
 
 /**

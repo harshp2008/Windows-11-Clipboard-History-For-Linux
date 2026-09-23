@@ -53,6 +53,17 @@ pub struct UserSettings {
     /// UI scale factor for the clipboard window (0.5 to 2.0, default 1.0)
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+
+    // --- Behaviour ---
+    /// When true (default), the clipboard window floats above other windows
+    /// while it is open. Disable to let it blend in as a normal window layer.
+    #[serde(default = "default_true")]
+    pub always_on_top: bool,
+
+    /// When true (default), the window is hidden when the user types in another
+    /// application while the clipboard panel is visible but unfocused.
+    #[serde(default = "default_true")]
+    pub close_on_typing_when_unfocused: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -97,6 +108,8 @@ impl Default for UserSettings {
             auto_delete_unit: "hours".to_string(),
             custom_kaomojis: Vec::new(),
             ui_scale: default_ui_scale(),
+            always_on_top: true,
+            close_on_typing_when_unfocused: true,
         }
     }
 }

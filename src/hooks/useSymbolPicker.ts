@@ -32,11 +32,10 @@ export function useSymbolPicker() {
     return getSymbols(selectedCategory, searchQuery)
   }, [selectedCategory, searchQuery])
 
-  // Paste symbol
+  // Paste symbol while keeping the picker open for consecutive selections.
   const pasteSymbol = useCallback(async (symbol: SymbolItem) => {
     try {
-      // Use the generic paste_text command
-      await invoke('paste_text', { text: symbol.char })
+      await invoke('paste_text', { text: symbol.char, hideWindow: false })
 
       // Update recent
       setRecentSymbols((prev) => {
@@ -47,8 +46,6 @@ export function useSymbolPicker() {
       })
     } catch (err) {
       console.error('Failed to paste symbol:', err)
-      // Fallback: write to clipboard and maybe warn user?
-      // For now assume paste_emoji works or fails silently.
     }
   }, [])
 

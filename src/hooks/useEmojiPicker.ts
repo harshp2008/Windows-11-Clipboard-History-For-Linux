@@ -71,10 +71,12 @@ export function useEmojiPicker() {
     return allEmojis
   }, [searchQuery, selectedCategory, allEmojis, recentEmojis])
 
-  // Paste an emoji
+  // Paste an emoji while keeping the picker open for consecutive selections.
+  // hideWindow: false → the backend uses focus-swap (activate target app, type,
+  // re-activate clipboard) rather than hiding the window.
   const pasteEmoji = useCallback(async (emoji: Emoji) => {
     try {
-      await invoke('paste_text', { text: emoji.char, itemType: 'emoji' })
+      await invoke('paste_text', { text: emoji.char, itemType: 'emoji', hideWindow: false })
       // Refresh recent emojis after paste
       const recent: RecentEmoji[] = await invoke('get_recent_emojis')
       const emojiMap = new Map(loadEmojis().map((e) => [e.char, e]))

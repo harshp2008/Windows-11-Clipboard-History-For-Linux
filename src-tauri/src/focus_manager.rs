@@ -296,3 +296,242 @@ pub fn x11_robust_activate(title: &str) -> Result<(), String> {
 
     Ok(())
 }
+
+// =============================================================================
+// GNOME Wayland — focus / window-layer management via window-calls D-Bus
+// =============================================================================
+//
+// `org.gnome.Shell.Eval` is disabled on this system (returns `(false, '')`).
+// Instead we use the `window-calls` GNOME Shell extension which exposes a fully
+// functional D-Bus API:
+//
+//   Destination  : org.gnome.Shell
+//   Object path  : /org/gnome/Shell/Extensions/Windows
+//   Interface    : org.gnome.Shell.Extensions.Windows
+//   Methods used : List, Activate, MakeAbove, UnmakeAbove
+//
+// Window IDs are u32 values in the D-Bus interface signature (GLib uint).
+
+const WC_DEST: &str = "org.gnome.Shell";
+const WC_PATH: &str = "/org/gnome/Shell/Extensions/Windows";
+const WC_IFACE: &str = "org.gnome.Shell.Extensions.Windows";
+const WC_CLIPBOARD_WM_CLASS: &str = "win11-clipboard-history";
+
+/// Minimal window descriptor parsed from the JSON returned by
+/// `org.gnome.Shell.Extensions.Windows.List`.
+#[derive(serde::Deserialize, Debug)]
+struct WcWindow {
+    id: u64,
+    #[serde(default)]
+    pid: u32,
+    #[serde(default)]
+    wm_class: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    focus: bool,
+}
+
+use parking_lot::Mutex;
+use std::collections::VecDeque;
+
+/// Mutex-guarded 2-window focus history stack (stores last 2 non-clipboard active window IDs and their wm_class).
+static FOCUS_HISTORY: Mutex<VecDeque<(u64, String)>> = Mutex::new(VecDeque::new());
+
+/// Push a non-clipboard window ID and its class to the 2-window focus history stack.
+pub fn wayland_push_focus_history(winid: u64, wm_class: String) {
+    if winid == 0 {
+        return;
+    }
+    let mut history = FOCUS_HISTORY.lock();
+    if history.front().map(|(id, _)| *id) == Some(winid) {
+        return;
+    }
+    history.push_front((winid, wm_class));
+    while history.len() > 2 {
+        history.pop_back();
+    }
+    eprintln!("[FocusManager] Focus history stack: {:?}", *history);
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Call a `window-calls` method that takes no arguments (e.g. `List`).
+fn wc_call_list() -> Result<Vec<WcWindow>, String> {
+    let output = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            WC_DEST,
+            "--object-path",
+            WC_PATH,
+            "--method",
+            &format!("{}.List", WC_IFACE),
+        ])
+        .output()
+        .map_err(|e| format!("gdbus List failed to start: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gdbus List exited with error: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    // The response is a GLib variant: ('[{"id":123,...}]',)\n
+    // Extract the JSON array between the first '[' and the last ']'.
+    let raw = String::from_utf8_lossy(&output.stdout);
+    let start = raw.find('[').ok_or("No '[' in List response")?;
+    let end = raw.rfind(']').ok_or("No ']' in List response")?;
+    let json = &raw[start..=end];
+
+    serde_json::from_str::<Vec<WcWindow>>(json)
+        .map_err(|e| format!("JSON parse error: {} — raw: {}", e, json))
+}
+
+/// Call a `window-calls` method that takes a single u32 window-ID argument.
+/// Covers `Activate`, `MakeAbove`, `UnmakeAbove`, `Minimize`, etc.
+fn wc_call_winid(method: &str, winid: u64) -> Result<(), String> {
+    if winid == 0 {
+        return Err(format!("{}: window ID is 0", method));
+    }
+
+    let full_method = format!("{}.{}", WC_IFACE, method);
+    let id_str = format!("uint32 {}", winid);
+
+    let output = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            WC_DEST,
+            "--object-path",
+            WC_PATH,
+            "--method",
+            &full_method,
+            &id_str,
+        ])
+        .output()
+        .map_err(|e| format!("gdbus {} failed to start: {}", method, e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gdbus {} exited with error: {}",
+            method,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    eprintln!("[FocusManager] window-calls {} winid={}", method, winid);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Queries the window-calls extension for the currently focused window and
+/// pushes its ID to the 2-window focus stack. Call this just *before* showing
+/// the clipboard window so we capture the correct target application.
+///
+/// Windows owned by `win11-clipboard-history` are excluded.
+pub fn wayland_save_focused_window_id() {
+    match wc_call_list() {
+        Ok(windows) => {
+            // If clipboard history window itself currently has focus, NEVER push or overwrite.
+            if windows.iter().any(|w| w.focus && w.wm_class == WC_CLIPBOARD_WM_CLASS) {
+                eprintln!(
+                    "[FocusManager] Clipboard history already has focus, preserving focus history: {:?}",
+                    *FOCUS_HISTORY.lock()
+                );
+                return;
+            }
+
+            // Prefer the window that currently has focus.
+            let target = windows
+                .iter()
+                .find(|w| w.focus && w.wm_class != WC_CLIPBOARD_WM_CLASS);
+
+            if let Some(win) = target {
+                wayland_push_focus_history(win.id, win.wm_class.clone());
+                eprintln!(
+                    "[FocusManager] Saved target window id={} class='{}' pid={}",
+                    win.id, win.wm_class, win.pid
+                );
+            } else {
+                // If no window reports focus=true (rare), fallback only if stack is empty.
+                let existing = wayland_get_saved_window_id();
+                if existing == 0 {
+                    if let Some(win) = windows.iter().find(|w| w.wm_class != WC_CLIPBOARD_WM_CLASS) {
+                        wayland_push_focus_history(win.id, win.wm_class.clone());
+                        eprintln!(
+                            "[FocusManager] Fallback saved target window id={} class='{}'",
+                            win.id, win.wm_class
+                        );
+                    } else {
+                        eprintln!("[FocusManager] No suitable target window found in List");
+                    }
+                } else {
+                    eprintln!(
+                        "[FocusManager] No focused non-clipboard window found; preserving existing target id={}",
+                        existing
+                    );
+                }
+            }
+        }
+        Err(e) => eprintln!("[FocusManager] wayland_save_focused_window_id: {}", e),
+    }
+}
+
+/// Clears the saved target window focus history.
+pub fn wayland_clear_saved_window_id() {
+    let mut history = FOCUS_HISTORY.lock();
+    history.clear();
+    eprintln!("[FocusManager] Cleared focus history stack");
+}
+
+/// Returns the window ID at the top of the 2-window focus stack.
+/// Returns 0 if no target has been saved.
+pub fn wayland_get_saved_window_id() -> u64 {
+    let history = FOCUS_HISTORY.lock();
+    history.front().map(|(id, _)| *id).unwrap_or(0)
+}
+
+/// Returns the wm_class of the window at the top of the 2-window focus stack.
+pub fn wayland_get_saved_window_class() -> String {
+    let history = FOCUS_HISTORY.lock();
+    history.front().map(|(_, class)| class.clone()).unwrap_or_default()
+}
+
+/// Activate (focus) a window by its `window-calls` integer ID.
+pub fn wayland_activate_window_id(winid: u64) -> Result<(), String> {
+    wc_call_winid("Activate", winid)
+}
+
+/// Set or clear the "keep above all other windows" layer for a window.
+/// Uses `MakeAbove` / `UnmakeAbove` from the window-calls extension which
+/// maps directly to Mutter's `meta_window_make_above()`.
+pub fn wayland_set_keep_above(winid: u64, above: bool) -> Result<(), String> {
+    let method = if above { "MakeAbove" } else { "UnmakeAbove" };
+    wc_call_winid(method, winid)
+}
+
+/// Looks up the clipboard window ID from the live window list.
+/// Matches the first window with `wm_class == "win11-clipboard-history"`
+/// whose title does NOT contain "Settings".
+pub fn wayland_get_clipboard_window_id() -> Result<u64, String> {
+    let windows = wc_call_list()?;
+    windows
+        .iter()
+        .find(|w| {
+            w.wm_class == WC_CLIPBOARD_WM_CLASS && !w.title.to_lowercase().contains("settings")
+        })
+        .map(|w| {
+            eprintln!("[FocusManager] Clipboard window id={}", w.id);
+            w.id
+        })
+        .ok_or_else(|| "Clipboard main window not found in List".to_string())
+}

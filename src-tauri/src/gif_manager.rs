@@ -1,8 +1,8 @@
 //! GIF Manager
 //! Handles downloading GIFs and preparing them for clipboard paste.
 //!
-//! IMPORTANT: This module handles specific OS-level clipboard commands (wl-copy/xclip)
-//! to ensure GIFs are pasted as files (text/uri-list) rather than raw bytes or text.
+//! IMPORTANT: This module handles clipboard setting via in-memory arboard on Wayland
+//! and xclip on X11 to ensure GIFs are pasted as files (text/uri-list) rather than raw bytes or text.
 //! This is required for rich media pasting in apps like Discord/Chrome on Linux.
 
 use crate::session;
@@ -20,7 +20,6 @@ use std::time::Duration;
 const APP_CACHE_DIR: &str = "win11-clipboard-history/gifs";
 const MIME_URI_LIST: &str = "text/uri-list";
 const DOWNLOAD_TIMEOUT: u64 = 10;
-const WL_COPY_SETTLE_TIME: u64 = 150;
 
 // --- Cache Management ---
 
@@ -103,57 +102,30 @@ impl ClipboardHandler {
         format!("file://{}\n", path.to_string_lossy())
     }
 
-    /// Uses `wl-copy` to set clipboard on Wayland.
+    /// Sets clipboard in-memory using `arboard` on Wayland.
     ///
-    /// CRITICAL: wl-copy forks to background to serve the paste request.
-    /// We must write to its stdin, then let it detach.
+    /// Avoids spawning external CLI subprocesses, which trigger GNOME Mutter's
+    /// Focus Stealing Prevention and "wl-clipboard is ready by unknown" notifications.
     fn copy_wayland(path: &Path) -> Result<(), String> {
         let uri = Self::make_file_uri(path);
+        let uri_trimmed = uri.trim();
 
-        // Env vars are strictly required for wl-copy context
-        let display =
-            std::env::var("WAYLAND_DISPLAY").map_err(|_| "WAYLAND_DISPLAY not set".to_string())?;
-        let runtime_dir =
-            std::env::var("XDG_RUNTIME_DIR").map_err(|_| "XDG_RUNTIME_DIR not set".to_string())?;
+        eprintln!("[GifManager] Setting in-memory clipboard text/URI to {}", uri_trimmed);
 
-        eprintln!("[GifManager] Executing wl-copy ({})", MIME_URI_LIST);
+        let mut clipboard = Clipboard::new()
+            .map_err(|e| format!("Failed to initialize clipboard: {}", e))?;
 
-        let mut child = Command::new("wl-copy")
-            .env("WAYLAND_DISPLAY", display)
-            .env("XDG_RUNTIME_DIR", runtime_dir)
-            .args(["--type", MIME_URI_LIST])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to spawn wl-copy: {}", e))?;
+        clipboard
+            .set_text(uri_trimmed)
+            .map_err(|e| format!("Failed to set clipboard text: {}", e))?;
 
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(uri.as_bytes())
-                .map_err(|e| format!("Pipe write error: {}", e))?;
+        #[cfg(target_os = "linux")]
+        {
+            use arboard::{LinuxClipboardKind, SetExtLinux};
+            let _ = clipboard.set().clipboard(LinuxClipboardKind::Primary).text(uri_trimmed);
         }
 
-        // Wait briefly for wl-copy to initialize logic, but don't wait for exit
-        // as it stays alive to serve the clipboard.
-        std::thread::sleep(Duration::from_millis(WL_COPY_SETTLE_TIME));
-
-        // Check if it crashed immediately
-        match child.try_wait() {
-            Ok(Some(status)) if !status.success() => {
-                let stderr = child
-                    .wait_with_output()
-                    .ok()
-                    .map(|o| String::from_utf8_lossy(&o.stderr).to_string())
-                    .unwrap_or_else(|| "Unknown error".into());
-                Err(format!("wl-copy crashed: {}", stderr))
-            }
-            Ok(_) => {
-                eprintln!("[GifManager] wl-copy running in background");
-                Ok(())
-            }
-            Err(e) => Err(format!("Process status check failed: {}", e)),
-        }
+        Ok(())
     }
 
     /// Uses `xclip` to set clipboard on X11.

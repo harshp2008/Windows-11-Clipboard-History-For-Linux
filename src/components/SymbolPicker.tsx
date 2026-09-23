@@ -276,7 +276,7 @@ export function SymbolPicker({ isDark, opacity }: SymbolPickerProps) {
           </>
         ) : (
           <span className="text-xs dark:text-win11-text-tertiary text-win11Light-text-secondary">
-            Click to paste symbol
+            Click to paste • window stays open
           </span>
         )
       }
