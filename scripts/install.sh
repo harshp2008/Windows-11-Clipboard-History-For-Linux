@@ -649,10 +649,12 @@ launch_app() {
     
     sleep 2
     
-    if pgrep -f "win11-clipboard-history" > /dev/null; then
-        return 0
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "win11-clipboard-history" >/dev/null 2>&1 && return 0 || return 1
+    elif command -v ps >/dev/null 2>&1; then
+        ps aux | grep -v grep | grep -q "win11-clipboard-history" && return 0 || return 1
     else
-        return 1
+        return 0
     fi
 }
 
