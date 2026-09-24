@@ -72,6 +72,7 @@ detect_distro() {
         . /etc/os-release
         DISTRO_ID="${ID}"
         DISTRO_ID_LIKE="${ID_LIKE:-}"
+        DISTRO_VERSION_ID="${VERSION_ID:-}"
         SYSTEM_FAMILY_INFO=$(echo "$ID $ID_LIKE" | tr '[:upper:]' '[:lower:]')
     else
         error "Cannot detect distribution. /etc/os-release not found."
@@ -544,7 +545,22 @@ check_and_install_deps() {
     local BUILD_DEPS=(build-essential curl wget file pkg-config libssl-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libudev-dev)
     local MISSING_DEPS=()
     
+    # Ensure apt package list is updated before checking package availability
+    sudo apt-get update -qq || true
+
+    local use_webkit_41=false
     if apt-cache show libwebkit2gtk-4.1-dev >/dev/null 2>&1; then
+        use_webkit_41=true
+    else
+        local major_ver="${DISTRO_VERSION_ID%%.*}"
+        if [[ "$SYSTEM_FAMILY_INFO" =~ "ubuntu" && "$major_ver" -ge 24 ]] 2>/dev/null; then
+            use_webkit_41=true
+        elif [[ "$SYSTEM_FAMILY_INFO" =~ "debian" && "$major_ver" -ge 12 ]] 2>/dev/null; then
+            use_webkit_41=true
+        fi
+    fi
+
+    if [ "$use_webkit_41" = true ]; then
         BUILD_DEPS+=(libwebkit2gtk-4.1-dev)
         RUNTIME_DEPS+=(libwebkit2gtk-4.1-0)
     else
@@ -561,7 +577,6 @@ check_and_install_deps() {
     if [ ${#MISSING_DEPS[@]} -gt 0 ]; then
         log "Missing dependencies detected: ${MISSING_DEPS[*]}"
         log "Installing via apt-get..."
-        sudo apt-get update -qq || true
         sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${MISSING_DEPS[@]}"
     else
         success "All apt dependencies are satisfied."
