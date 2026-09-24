@@ -24,11 +24,14 @@ export default class Windows11ClipboardBridge extends Extension {
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, this);
         this._dbusImpl.export(Gio.DBus.session, '/org/gnome/Shell/Extensions/Windows11ClipboardBridge');
 
-        // Suppress "Window is ready" notifications by automatically activating requesting windows
+        // Connect to 'window-demands-attention' to automatically grant focus.
+        // This is necessary on Wayland because Mutter imposes strict Focus Stealing Prevention.
+        // When our application requests focus while pinned, this bypasses the restriction
+        // and prevents the "Window is ready" notification from appearing.
         this._demandsAttentionId = global.display.connect(
             'window-demands-attention',
             (display, window) => {
-                if (!window) return;
+                if (!window || typeof window.activate !== 'function') return;
                 try {
                     const timestamp = global.get_current_time();
                     window.activate(timestamp);
@@ -54,6 +57,16 @@ export default class Windows11ClipboardBridge extends Extension {
     }
 
     ForcePin(targetPid) {
+        if (!Number.isInteger(targetPid) || targetPid <= 0) {
+            console.error(`[ClipboardBridge] ForcePin: Invalid target PID ${targetPid}`);
+            return;
+        }
+
+        // Architectural Note:
+        // On Wayland, standard X11 window IDs are not exposed to clients or DBus seamlessly.
+        // Mutter abstracts Wayland surfaces as MetaWindow objects, which lack global IDs.
+        // Therefore, we use the process ID (PID) to securely identify and match our
+        // application's windows for foreground elevation and pinning.
         const actors = global.get_window_actors();
         for (let i = actors.length - 1; i >= 0; i--) {
             const win = actors[i].meta_window;
@@ -77,6 +90,11 @@ export default class Windows11ClipboardBridge extends Extension {
     }
 
     SetAlwaysOnTop(targetPid, state) {
+        if (!Number.isInteger(targetPid) || targetPid <= 0) {
+            console.error(`[ClipboardBridge] SetAlwaysOnTop: Invalid target PID ${targetPid}`);
+            return;
+        }
+
         const actors = global.get_window_actors();
         for (const actor of actors) {
             const win = actor.meta_window;

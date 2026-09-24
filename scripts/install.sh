@@ -686,6 +686,11 @@ main() {
         install_appimage || build_from_source
     fi
     
+    # Enable GNOME Shell companion extension if gnome-extensions is available
+    if command -v gnome-extensions &>/dev/null; then
+        gnome-extensions enable win11-clipboard-bridge@harshp2008.github.com 2>/dev/null || true
+    fi
+
     # Try to launch
     if launch_app; then
         echo ""
@@ -701,6 +706,12 @@ main() {
         success " Press Super+V to open your clipboard history."
         success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     fi
+
+    echo ""
+    echo -e "${YELLOW}Important (GNOME / Wayland users):${NC}"
+    echo -e "After installing for the first time, you must ${GREEN}log out and log back in${NC} (or restart your machine) so GNOME Shell loads the companion extension."
+    echo -e "If Always-On-Top pinning does not work immediately after login, ensure the extension is enabled:"
+    echo -e "  ${BLUE}gnome-extensions enable win11-clipboard-bridge@harshp2008.github.com${NC}"
     echo ""
 }
 

@@ -25,11 +25,19 @@
 Get up and running in seconds. This script detects your distro, installs the app, and configures permissions automatically.
 
 ```bash
-# Just copy and paste this into your terminal
+# Automated installer (fetches pre-built package or builds if needed)
 curl -fsSL https://raw.githubusercontent.com/gustavosett/Windows-11-Clipboard-History-For-Linux/master/scripts/install.sh | bash
+
+# Or if you cloned the repository locally:
+./scripts/install.sh
+
+# To force a build from source locally:
+./scripts/install.sh --build
 ```
 
-> **Note:** No logout required! The installer uses ACLs to grant immediate access.
+> [!IMPORTANT]
+> **First-Time Setup / Post-Install Step (GNOME & Wayland users):**
+> After installing for the first time, you must **log out and log back in** (or restart your machine). GNOME Shell only scans and registers newly installed system-wide extensions upon starting a fresh session.
 
 ---
 
@@ -46,6 +54,31 @@ Most Linux clipboard managers are purely functional but lack visual appeal. This
 | **🎬 ~~GIF Integration~~** | ~~Search Tenor and paste GIFs directly into Discord, Slack, etc.~~ **Disabled:** [Google killed the Tenor GIF API](https://arstechnica.com/gadgets/2026/06/google-kills-tenor-gif-api-forcing-changes-at-x-discord-and-more/). |
 | **🤩 Emoji Picker** | A built-in, searchable emoji keyboard. |
 | **🛡️ Privacy First** | Your history is stored locally. No data leaves your machine. |
+
+---
+
+## 🧩 GNOME Shell Extension & Wayland Layer Support
+
+Under Wayland, compositors like GNOME Shell (Mutter) enforce strict security boundaries and **Focus Stealing Prevention (FSP)**, which can prevent standalone popup windows from gaining instant keyboard focus or staying deterministically pinned above other fullscreen and focused applications.
+
+To deliver a seamless Windows 11-style experience, this project includes a companion GNOME Shell extension (`win11-clipboard-bridge@harshp2008.github.com`). The bridge communicates with the clipboard manager over D-Bus to:
+- **Bypass Focus Stealing Prevention (FSP):** Ensures the clipboard palette immediately captures focus upon trigger without being blocked by Mutter.
+- **Deterministic Always-On-Top Layering:** Guarantees the palette remains pinned on top until an item is selected or dismissed.
+
+### Extension Verification & Commands
+
+The installer configures and attempts to enable the extension automatically. You can verify or control it manually:
+
+- **Enable extension:**
+  ```bash
+  gnome-extensions enable win11-clipboard-bridge@harshp2008.github.com
+  ```
+
+- **Verify extension status:**
+  ```bash
+  gnome-extensions info win11-clipboard-bridge@harshp2008.github.com
+  ```
+  *(Look for `State: ACTIVE` / `Enabled: Yes`)*
 
 ---
 
@@ -150,6 +183,24 @@ KEYBOARD SETTINGS -> SHORTCUTS -> NEW SHORTCUT -> Super+V -> ./my_awesome_folder
 ---
 
 ## 🔧 Troubleshooting
+
+<details>
+<summary><b>Palette loses focus or does not stay pinned on top under Wayland</b></summary>
+
+Under GNOME on Wayland, the companion bridge extension must be in the `ACTIVE` state to manage window focus and Always-On-Top layering:
+
+1. **Verify extension state:**
+   ```bash
+   gnome-extensions info win11-clipboard-bridge@harshp2008.github.com
+   ```
+2. **Enable via terminal:**
+   ```bash
+   gnome-extensions enable win11-clipboard-bridge@harshp2008.github.com
+   ```
+3. **Or enable via GUI:** Open the **Extensions** app or **Extension Manager** on GNOME and toggle **"Windows 11 Clipboard History Bridge"** to **ON**.
+4. **First-time installation note:** If you just installed the package, remember to **log out and log back in** once so GNOME Shell registers the newly installed extension.
+
+</details>
 
 <details>
 <summary><b>Shortcut (Super+V) isn't working</b></summary>
