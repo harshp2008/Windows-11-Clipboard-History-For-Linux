@@ -1,0 +1,23 @@
+FROM ubuntu:24.04
+
+# Avoid tzdata interactive prompts
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+COPY . .
+
+# We need sudo for the installer script to work
+RUN apt-get update && apt-get install -y sudo
+
+# Create a non-root user for the build to test sudo and user environment
+RUN useradd -m -s /bin/bash builder && \
+    echo "builder ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+# Make sure permissions are correct
+RUN chown -R builder:builder /app
+
+USER builder
+WORKDIR /app
+
+# Run the installation test
+CMD ["/bin/bash", "scripts/install.sh", "--build"]

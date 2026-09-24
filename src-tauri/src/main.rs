@@ -20,7 +20,7 @@ use win11_clipboard_history_lib::focus_manager::{
     restore_focused_window, save_focused_window,
     wayland_activate_window_id, wayland_clear_saved_window_id, wayland_get_saved_window_id,
     wayland_get_clipboard_window_id, wayland_save_focused_window_id,
-    wayland_set_keep_above,
+    wayland_set_keep_above, gnome_extension_force_pin,
 };
 use win11_clipboard_history_lib::input_simulator::simulate_paste_keystroke;
 use win11_clipboard_history_lib::permission_checker;
@@ -490,8 +490,19 @@ impl WindowController {
             let _ = window.set_always_on_top(true); // compositor hint (best-effort)
             // On Wayland, avoid window.set_focus() as it triggers Mutter's Focus Stealing Prevention toast.
             // The GTK Utility hint, set_keep_above, gtk_window.present(), and window.show() present the window on top cleanly.
-            #[cfg(not(target_os = "linux"))]
-            let _ = window.set_focus();
+
+            #[cfg(target_os = "linux")]
+            if is_wayland_session {
+                tauri::async_runtime::spawn(async move {
+                    let intervals = [40, 120, 250, 500];
+                    for delay in intervals {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                        if let Err(e) = gnome_extension_force_pin() {
+                            eprintln!("[FocusManager] ForcePin D-Bus call failed: {}", e);
+                        }
+                    }
+                });
+            }
         } else {
             let _ = window.show();
             let _ = window.set_focus();
@@ -521,6 +532,7 @@ impl WindowController {
                         std::thread::sleep(std::time::Duration::from_millis(40));
                         if let Ok(cb_id) = wayland_get_clipboard_window_id() {
                             let _ = wayland_set_keep_above(cb_id, true);
+                            let _ = gnome_extension_force_pin();
                             break;
                         }
                     }

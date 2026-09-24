@@ -35,7 +35,7 @@ RED := \033[0;31m
 RESET := \033[0m
 
 .PHONY: all help deps deps-ubuntu deps-debian deps-fedora deps-arch \
-        rust node check-deps dev build install uninstall clean clean-first-run run \
+        rust node check-deps test-deps dev build install uninstall clean clean-first-run run \
         lint format test release
 
 all: build
@@ -189,23 +189,27 @@ node:
 		echo -e "$(GREEN)✓ Node.js installed$(RESET)"; \
 	fi
 
-check-deps:
+check-deps test-deps:
 	@echo -e "$(CYAN)Checking dependencies...$(RESET)"
 	@echo ""
-	@echo "System tools:"
-	@command -v rustc &> /dev/null && echo -e "  $(GREEN)✓$(RESET) Rust: $$(rustc --version)" || echo -e "  $(RED)✗$(RESET) Rust: not found"
-	@command -v cargo &> /dev/null && echo -e "  $(GREEN)✓$(RESET) Cargo: $$(cargo --version)" || echo -e "  $(RED)✗$(RESET) Cargo: not found"
-	@command -v node &> /dev/null && echo -e "  $(GREEN)✓$(RESET) Node.js: $$(node --version)" || echo -e "  $(RED)✗$(RESET) Node.js: not found"
-	@command -v npm &> /dev/null && echo -e "  $(GREEN)✓$(RESET) npm: $$(npm --version)" || echo -e "  $(RED)✗$(RESET) npm: not found"
+	@printf "%-25s %-15s %s\n" "Dependency" "Status" "Version/Details"
+	@printf "%-25s %-15s %s\n" "----------" "------" "---------------"
+	@command -v rustc &> /dev/null && printf "%-25s $(GREEN)%-15s$(RESET) %s\n" "Rust" "[FOUND]" "$$(rustc --version)" || printf "%-25s $(RED)%-15s$(RESET) %s\n" "Rust" "[MISSING]" "not found"
+	@command -v cargo &> /dev/null && printf "%-25s $(GREEN)%-15s$(RESET) %s\n" "Cargo" "[FOUND]" "$$(cargo --version)" || printf "%-25s $(RED)%-15s$(RESET) %s\n" "Cargo" "[MISSING]" "not found"
+	@command -v node &> /dev/null && printf "%-25s $(GREEN)%-15s$(RESET) %s\n" "Node.js" "[FOUND]" "$$(node --version)" || printf "%-25s $(RED)%-15s$(RESET) %s\n" "Node.js" "[MISSING]" "not found"
+	@command -v npm &> /dev/null && printf "%-25s $(GREEN)%-15s$(RESET) %s\n" "npm" "[FOUND]" "$$(npm --version)" || printf "%-25s $(RED)%-15s$(RESET) %s\n" "npm" "[MISSING]" "not found"
+	@command -v pkg-config &> /dev/null && printf "%-25s $(GREEN)%-15s$(RESET) %s\n" "pkg-config" "[FOUND]" "$$(pkg-config --version)" || printf "%-25s $(RED)%-15s$(RESET) %s\n" "pkg-config" "[MISSING]" "not found"
 	@echo ""
-	@echo "Libraries:"
-	@pkg-config --exists webkit2gtk-4.1 2>/dev/null && echo -e "  $(GREEN)✓$(RESET) webkit2gtk-4.1" || echo -e "  $(RED)✗$(RESET) webkit2gtk-4.1"
-	@pkg-config --exists gtk+-3.0 2>/dev/null && echo -e "  $(GREEN)✓$(RESET) gtk+-3.0" || echo -e "  $(RED)✗$(RESET) gtk+-3.0"
-	@pkg-config --exists glib-2.0 2>/dev/null && echo -e "  $(GREEN)✓$(RESET) glib-2.0" || echo -e "  $(RED)✗$(RESET) glib-2.0"
-	@pkg-config --exists openssl 2>/dev/null && echo -e "  $(GREEN)✓$(RESET) openssl" || echo -e "  $(RED)✗$(RESET) openssl"
+	@printf "%-25s %-15s %s\n" "C Library (pkg-config)" "Status" ""
+	@printf "%-25s %-15s %s\n" "----------------------" "------" ""
+	@pkg-config --exists webkit2gtk-4.1 2>/dev/null && printf "%-25s $(GREEN)%-15s$(RESET)\n" "webkit2gtk-4.1" "[FOUND]" || (pkg-config --exists webkit2gtk-4.0 2>/dev/null && printf "%-25s $(YELLOW)%-15s$(RESET) %s\n" "webkit2gtk-4.0" "[FOUND]" "(legacy)" || printf "%-25s $(RED)%-15s$(RESET)\n" "webkit2gtk-4.1" "[MISSING]")
+	@pkg-config --exists gtk+-3.0 2>/dev/null && printf "%-25s $(GREEN)%-15s$(RESET)\n" "gtk+-3.0" "[FOUND]" || printf "%-25s $(RED)%-15s$(RESET)\n" "gtk+-3.0" "[MISSING]"
+	@pkg-config --exists ayatana-appindicator3-0.1 2>/dev/null && printf "%-25s $(GREEN)%-15s$(RESET)\n" "ayatana-appindicator3-0.1" "[FOUND]" || (pkg-config --exists appindicator3-0.1 2>/dev/null && printf "%-25s $(YELLOW)%-15s$(RESET) %s\n" "appindicator3-0.1" "[FOUND]" "(legacy)" || printf "%-25s $(RED)%-15s$(RESET)\n" "ayatana-appindicator3-0.1" "[MISSING]")
+	@pkg-config --exists librsvg-2.0 2>/dev/null && printf "%-25s $(GREEN)%-15s$(RESET)\n" "librsvg-2.0" "[FOUND]" || printf "%-25s $(RED)%-15s$(RESET)\n" "librsvg-2.0" "[MISSING]"
+	@pkg-config --exists openssl 2>/dev/null && printf "%-25s $(GREEN)%-15s$(RESET)\n" "openssl" "[FOUND]" || printf "%-25s $(RED)%-15s$(RESET)\n" "openssl" "[MISSING]"
+	@(pkg-config --exists libxdo 2>/dev/null || [ -f /usr/include/xdo.h ] || ldconfig -p 2>/dev/null | grep -q libxdo) && printf "%-25s $(GREEN)%-15s$(RESET)\n" "libxdo" "[FOUND]" || printf "%-25s $(RED)%-15s$(RESET)\n" "libxdo" "[MISSING]"
+	@pkg-config --exists libudev 2>/dev/null && printf "%-25s $(GREEN)%-15s$(RESET)\n" "libudev" "[FOUND]" || printf "%-25s $(RED)%-15s$(RESET)\n" "libudev" "[MISSING]"
 	@echo ""
-
-# ============================================================================
 # Development
 # ============================================================================
 
@@ -236,13 +240,34 @@ build: node_modules
 # Install / Uninstall
 # ============================================================================
 
-install:
+install-extension:
+	@echo -e "$(CYAN)Installing GNOME Shell extension...$(RESET)"
+	@mkdir -p $(DESTDIR)/usr/share/gnome-shell/extensions/win11-clipboard-bridge@harshp2008.github.com
+	install -Dm644 extensions/win11-clipboard-bridge@harshp2008.github.com/metadata.json $(DESTDIR)/usr/share/gnome-shell/extensions/win11-clipboard-bridge@harshp2008.github.com/metadata.json
+	install -Dm644 extensions/win11-clipboard-bridge@harshp2008.github.com/extension.js $(DESTDIR)/usr/share/gnome-shell/extensions/win11-clipboard-bridge@harshp2008.github.com/extension.js
+
+enable-extension:
+	@echo -e "$(CYAN)Enabling GNOME Shell extension...$(RESET)"
+	@gnome-extensions disable win11-clipboard-bridge@harshp2008.github.com 2>/dev/null || true
+	@gnome-extensions enable win11-clipboard-bridge@harshp2008.github.com 2>/dev/null || true
+
+install: install-extension enable-extension
 	@echo -e "$(CYAN)Installing $(APP_NAME)...$(RESET)"
+	@if [ ! -f "src-tauri/target/release/$(APP_NAME)-bin" ]; then \
+		echo -e "$(RED)Error: Release binary 'src-tauri/target/release/$(APP_NAME)-bin' not found.$(RESET)"; \
+		echo -e "$(RED)Run 'npm run tauri:build' or 'make build' as your normal user first.$(RESET)"; \
+		exit 1; \
+	fi
+	@# Stop any running instances safely
+	@killall -9 $(APP_NAME)-bin 2>/dev/null || pkill -9 -x $(APP_NAME)-bin 2>/dev/null || true
 	@# Install binary to lib directory
 	@mkdir -p $(DESTDIR)$(LIBDIR)/$(APP_NAME)
 	install -Dm755 src-tauri/target/release/$(APP_NAME)-bin $(DESTDIR)$(LIBDIR)/$(APP_NAME)/$(APP_NAME)-bin
 	@# Install wrapper script to bin
 	install -Dm755 src-tauri/bundle/linux/wrapper.sh $(DESTDIR)$(BINDIR)/$(APP_NAME)
+	@# Set executable permissions
+	chmod +x $(DESTDIR)$(BINDIR)/$(APP_NAME)
+	@if [ -d "$(DESTDIR)/usr/bin" ]; then ln -sf $(DESTDIR)$(BINDIR)/$(APP_NAME) $(DESTDIR)/usr/bin/$(APP_NAME); fi
 	@# Install icons
 	install -Dm644 src-tauri/icons/128x128.png $(DESTDIR)$(DATADIR)/icons/hicolor/128x128/apps/$(APP_NAME).png
 	install -Dm644 src-tauri/icons/icon.png $(DESTDIR)$(DATADIR)/icons/hicolor/256x256/apps/$(APP_NAME).png
@@ -284,6 +309,7 @@ install:
 	@echo ""
 	@echo "The app will guide you through setup on first run."
 	@echo "You may need to log out and back in for input permissions to take effect."
+	@echo -e "$(YELLOW)Please log out and log back in once to enable the GNOME Shell companion extension.$(RESET)"
 	@echo ""
 
 uninstall:
@@ -319,6 +345,8 @@ uninstall:
 	rm -f $(DESTDIR)/etc/udev/rules.d/99-win11-clipboard-input.rules
 	rm -f $(DESTDIR)/etc/modules-load.d/uinput.conf
 	rm -f $(DESTDIR)/etc/modules-load.d/win11-clipboard.conf
+	@# Remove GNOME Shell extension
+	rm -rf $(DESTDIR)/usr/share/gnome-shell/extensions/win11-clipboard-bridge@harshp2008.github.com 2>/dev/null || true
 	@# Remove autostart entry for the user
 	@if [ -n "$$SUDO_USER" ]; then \
 		AUTOSTART_FILE=$$(getent passwd $$SUDO_USER | cut -d: -f6)/.config/autostart/$(APP_NAME).desktop; \

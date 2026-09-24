@@ -512,11 +512,75 @@ pub fn wayland_activate_window_id(winid: u64) -> Result<(), String> {
 }
 
 /// Set or clear the "keep above all other windows" layer for a window.
-/// Uses `MakeAbove` / `UnmakeAbove` from the window-calls extension which
-/// maps directly to Mutter's `meta_window_make_above()`.
+/// Uses the custom GNOME Shell extension bridge, and falls back to `MakeAbove`
+/// from the window-calls extension which maps directly to Mutter's `meta_window_make_above()`.
 pub fn wayland_set_keep_above(winid: u64, above: bool) -> Result<(), String> {
+    // Attempt our custom bridge first
+    let _ = gnome_extension_set_keep_above(winid, above);
+
     let method = if above { "MakeAbove" } else { "UnmakeAbove" };
     wc_call_winid(method, winid)
+}
+
+/// Invokes the custom GNOME Shell extension's SetAlwaysOnTop method.
+pub fn gnome_extension_set_keep_above(_winid: u64, above: bool) -> Result<(), String> {
+    let method = "org.gnome.Shell.Extensions.Windows11ClipboardBridge.SetAlwaysOnTop";
+    
+    let output = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.Shell",
+            "--object-path",
+            "/org/gnome/Shell/Extensions/Windows11ClipboardBridge",
+            "--method",
+            method,
+            &format!("uint32 {}", std::process::id()),
+            if above { "true" } else { "false" },
+        ])
+        .output()
+        .map_err(|e| format!("gdbus SetAlwaysOnTop failed to start: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gdbus SetAlwaysOnTop exited with error: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    eprintln!("[FocusManager] GNOME extension SetAlwaysOnTop above={}", above);
+    Ok(())
+}
+
+/// Invokes the custom GNOME Shell extension's ForcePin method.
+pub fn gnome_extension_force_pin() -> Result<(), String> {
+    let method = "org.gnome.Shell.Extensions.Windows11ClipboardBridge.ForcePin";
+    
+    let output = std::process::Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.gnome.Shell",
+            "--object-path",
+            "/org/gnome/Shell/Extensions/Windows11ClipboardBridge",
+            "--method",
+            method,
+            &format!("uint32 {}", std::process::id()),
+        ])
+        .output()
+        .map_err(|e| format!("gdbus ForcePin failed to start: {}", e))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "gdbus ForcePin exited with error: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    eprintln!("[FocusManager] GNOME extension ForcePin called");
+    Ok(())
 }
 
 /// Looks up the clipboard window ID from the live window list.

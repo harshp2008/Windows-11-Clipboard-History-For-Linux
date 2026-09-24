@@ -67,6 +67,22 @@ Most Linux clipboard managers are purely functional but lack visual appeal. This
 Prefer to install manually? We support all major distributions.
 
 <details>
+<summary><b>System Dependencies (Required for all Linux builds)</b></summary>
+
+Ensure the following packages are installed before compiling:
+- `libgtk-3-dev`
+- `libwebkit2gtk-4.1-dev`
+- `libayatana-appindicator3-dev`
+- `librsvg2-dev`
+- `libssl-dev`
+- `pkg-config`
+- `libxdo-dev`
+- `build-essential`
+- `cargo` / `rust`
+
+</details>
+
+<details>
 <summary><b>Debian / Ubuntu / Mint / Pop!_OS</b></summary>
 
 > **Recommended:** Use the APT repository for automatic updates.
