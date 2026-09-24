@@ -23,6 +23,21 @@ export default class Windows11ClipboardBridge extends Extension {
         console.log("[ClipboardBridge] ENABLED - DBus Only");
         this._dbusImpl = Gio.DBusExportedObject.wrapJSObject(DBUS_INTERFACE, this);
         this._dbusImpl.export(Gio.DBus.session, '/org/gnome/Shell/Extensions/Windows11ClipboardBridge');
+
+        // Suppress "Window is ready" notifications by automatically activating requesting windows
+        this._demandsAttentionId = global.display.connect(
+            'window-demands-attention',
+            (display, window) => {
+                if (!window) return;
+                try {
+                    const timestamp = global.get_current_time();
+                    window.activate(timestamp);
+                    Main.activateWindow(window);
+                } catch (err) {
+                    console.error(`[ClipboardBridge] Failed to activate attention-demanding window: ${err}`);
+                }
+            }
+        );
     }
 
     disable() {
@@ -30,6 +45,11 @@ export default class Windows11ClipboardBridge extends Extension {
         if (this._dbusImpl) {
             this._dbusImpl.unexport();
             this._dbusImpl = null;
+        }
+
+        if (this._demandsAttentionId) {
+            global.display.disconnect(this._demandsAttentionId);
+            this._demandsAttentionId = null;
         }
     }
 
